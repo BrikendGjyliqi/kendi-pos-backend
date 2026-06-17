@@ -1,0 +1,68 @@
+Kendi POS — Backend
+Spring Boot + PostgreSQL REST API for **Kendi POS**, a point-of-sale system designed for Kosovo cafes and restaurants.
+
+ Tech Stack
+
+- Java 21 + Spring Boot 3.5
+- PostgreSQL 16 (Docker)
+- Spring Data JPA + Hibernate
+- Spring Security** with BCrypt password hashing
+- Maven build tool
+
+ Features
+
+- 🔐 PIN-based authentication with BCrypt hashing
+- 📋 Full CRUD for Categories, Products, Tables, Staff, Orders
+- 💰 Multi-order support per table with split payment
+- 📊 Z-Report endpoint with daily revenue analytics
+- 👥 Per-staff sales reports
+- 🔄 Order state machine: open → closed → paid / cancelled
+- 🌐 CORS configured for multi-device LAN access
+
+API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/auth/login` | Login with PIN |
+| GET/POST/PUT/DELETE | `/api/staff` | Staff management |
+| GET/POST/PUT/DELETE | `/api/categories` | Menu categories |
+| GET/POST/PUT/DELETE | `/api/products` | Menu products |
+| GET/POST/PUT/DELETE | `/api/tables` | Restaurant tables |
+| GET/POST/PUT/DELETE | `/api/orders` | Order management |
+| POST | `/api/orders/{id}/close` | Close order |
+| POST | `/api/orders/{id}/pay` | Pay single order |
+| POST | `/api/orders/table/{id}/pay-all` | Pay all orders for table |
+| GET | `/api/reports/z-report?date=...` | Daily Z-Report |
+| GET | `/api/reports/staff?staffId=...` | Per-staff report |
+| GET | `/api/reports/history` | Order history |
+
+Getting Started
+Prerequisites
+- Java 21+
+- Docker Desktop
+- Maven (or use included `mvnw`)
+
+#Setup
+
+1. Start PostgreSQL with Docker:
+bash
+docker run --name kendi-db -e POSTGRES_PASSWORD=kendi123 -e POSTGRES_DB=kendi_pos -p 5432:5432 -d postgres:16
+
+
+2. Run the application:
+bash
+./mvnw spring-boot:run
+
+
+3. Backend will be available at `http://localhost:8080`
+
+ Default Login Credentials (seeded automatically)
+- Admin: PIN `0000`
+- Cashier: PIN `1234`
+
+ Related Projects
+
+-  [Kendi POS Frontend](https://github.com/BrikendGjyliqi/kendi-pos-frontend) — Vue 3 + TypeScript
+
+ Author
+Brikend Gjyliqi — Computer Science student at University of Hildesheim.
