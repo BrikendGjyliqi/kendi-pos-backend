@@ -3,6 +3,7 @@ package com.kendi.pos.order;
 import com.kendi.pos.product.Product;
 import com.kendi.pos.product.ProductRepository;
 import com.kendi.pos.product.StockUnit;
+import com.kendi.pos.restotable.ReservationService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
@@ -16,10 +17,12 @@ public class OrderController {
 
     private final OrderRepository repo;
     private final ProductRepository productRepo;
+    private final ReservationService reservationService;
 
-    public OrderController(OrderRepository repo, ProductRepository productRepo) {
+    public OrderController(OrderRepository repo, ProductRepository productRepo, ReservationService reservationService) {
         this.repo = repo;
         this.productRepo = productRepo;
+        this.reservationService = reservationService;
     }
 
     @GetMapping
@@ -62,7 +65,17 @@ public class OrderController {
             }
         }
         recalculate(order);
-        return repo.save(order);
+        Order saved = repo.save(order);
+
+        // Auto-mark rezervimin si ARRIVED dhe tavolinen ON_DINE
+        try {
+            Long tableIdLong = Long.parseLong(order.getTableId());
+            reservationService.markArrivedByTable(tableIdLong);
+        } catch (NumberFormatException e) {
+            // tableId nuk eshte numer - skip
+        }
+
+        return saved;
     }
 
     @PutMapping("/{id}")
@@ -131,8 +144,12 @@ public class OrderController {
 
                     // Pakeso stokun per items me autoDeduct
                     deductStockForOrder(o);
+                    Order saved = repo.save(o);
 
-                    return ResponseEntity.ok(repo.save(o));
+                    // Liro tavolinen nese s'ka porosi tjeter open/closed
+                    releaseTableIfNoActiveOrders(o.getTableId());
+
+                    return ResponseEntity.ok(saved);
                 })
                 .orElse(ResponseEntity.notFound().build());
     }
@@ -147,7 +164,12 @@ public class OrderController {
                     }
                     o.setStatus("cancelled");
                     o.setClosedAt(System.currentTimeMillis());
-                    return ResponseEntity.ok(repo.save(o));
+                    Order saved = repo.save(o);
+
+                    // Liro tavolinen nese s'ka porosi tjeter
+                    releaseTableIfNoActiveOrders(o.getTableId());
+
+                    return ResponseEntity.ok(saved);
                 })
                 .orElse(ResponseEntity.notFound().build());
     }
@@ -201,6 +223,10 @@ public class OrderController {
 
             repo.save(o);
         }
+
+        // Liro tavolinen
+        releaseTableIfNoActiveOrders(tableId);
+
         return unpaid;
     }
 
@@ -237,6 +263,24 @@ public class OrderController {
                     productRepo.save(product);
                 }
             });
+        }
+    }
+
+    /**
+     * Kontrollo nese tavolina ka porosi te tjera open/closed.
+     * Nese jo, liroje (bene AVAILABLE).
+     */
+    private void releaseTableIfNoActiveOrders(String tableId) {
+        boolean hasActive = repo.findByTableId(tableId).stream()
+                .anyMatch(o -> "open".equals(o.getStatus()) || "closed".equals(o.getStatus()));
+
+        if (!hasActive) {
+            try {
+                Long tableIdLong = Long.parseLong(tableId);
+                reservationService.releaseTable(tableIdLong);
+            } catch (NumberFormatException e) {
+                // tableId nuk eshte numer - skip
+            }
         }
     }
 }

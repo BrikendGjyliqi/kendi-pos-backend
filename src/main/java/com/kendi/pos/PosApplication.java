@@ -4,8 +4,10 @@ import com.kendi.pos.category.Category;
 import com.kendi.pos.category.CategoryRepository;
 import com.kendi.pos.product.Product;
 import com.kendi.pos.product.ProductRepository;
-import com.kendi.pos.restotable.RestoTable;
-import com.kendi.pos.restotable.RestoTableRepository;
+import com.kendi.pos.restotable.RestaurantTable;
+import com.kendi.pos.restotable.RestaurantTableRepository;
+import com.kendi.pos.restotable.Section;
+import com.kendi.pos.restotable.TableStatus;
 import com.kendi.pos.staff.Staff;
 import com.kendi.pos.staff.StaffRepository;
 import org.springframework.boot.CommandLineRunner;
@@ -29,7 +31,7 @@ public class PosApplication {
 			StaffRepository staffRepo,
 			CategoryRepository categoryRepo,
 			ProductRepository productRepo,
-			RestoTableRepository tableRepo
+			RestaurantTableRepository tableRepo
 	) {
 		return args -> {
 			long now = System.currentTimeMillis();
@@ -134,15 +136,22 @@ public class PosApplication {
 			}
 
 			// ─── TABLES ───
+			// ---- TABLES ----
 			if (tableRepo.count() == 0) {
-				for (int i = 1; i <= 10; i++) {
-					RestoTable t = new RestoTable();
-					t.setName("T" + i);
+				Section[] sections = {Section.MAIN_DINING, Section.MAIN_DINING, Section.MAIN_DINING,
+						Section.TERRACE, Section.TERRACE, Section.OUTDOOR};
+				int[] seatCounts = {4, 6, 2, 4, 8, 4};
+
+				for (int i = 1; i <= 6; i++) {
+					RestaurantTable t = new RestaurantTable();
+					t.setName("Table #" + i);
+					t.setSeatCount(seatCounts[i-1]);
+					t.setSection(sections[i-1]);
+					t.setStatus(TableStatus.AVAILABLE);
 					t.setSortOrder(i);
-					t.setCreatedAt(now);
 					tableRepo.save(t);
 				}
-				System.out.println("✅ Tables seeded");
+				System.out.println("Tables seeded");
 			}
 
 			System.out.println("🚀 Seed kompletë!");

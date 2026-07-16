@@ -8,10 +8,13 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+
 
 import java.util.List;
 
 @Configuration
+@EnableMethodSecurity
 public class SecurityConfig {
 
     @Bean
@@ -25,6 +28,8 @@ public class SecurityConfig {
                 );
         return http.build();
     }
+
+
 
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
