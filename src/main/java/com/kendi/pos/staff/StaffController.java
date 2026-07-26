@@ -72,4 +72,12 @@ public class StaffController {
         repo.deleteById(id);
         return ResponseEntity.noContent().build();
     }
+
+    @GetMapping("/cache")
+    public List<StaffCacheDto> getAllForCache() {
+        return repo.findAll().stream()
+                .filter(Staff::isActive)
+                .map(StaffCacheDto::from)
+                .toList();
+    }
 }
