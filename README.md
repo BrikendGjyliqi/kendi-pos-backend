@@ -2,13 +2,14 @@
 
 **Spring Boot REST API** for the Kendi POS restaurant management system.
 
-Built with **Spring Boot 3.5**, **Java 21**, **PostgreSQL 16**, and **Flyway** migrations. Serves as the authoritative source of truth for a Vue 3 + Tauri desktop point-of-sale, and supports an **offline-first client** through dedicated sync endpoints (health check, staff PIN cache, client-generated UUIDs).
+Built with **Spring Boot 3.5**, **Java 21**, **PostgreSQL 16**, and **Flyway** migrations. Serves as the authoritative source of truth for a Vue 3 + Tauri desktop point-of-sale, and supports an **offline-first client** through dedicated sync endpoints (health check, staff PIN cache, client-generated UUIDs). Ships with an **AI Analytics endpoint** that converts natural-language Albanian business questions into safe PostgreSQL queries and natural-language answers via Claude.
 
 ---
 
 ## Highlights
 
 - **Offline-first friendly** — dedicated `/api/health` endpoint for the client's sync engine, `/api/staff/cache` exposes BCrypt PIN hashes for offline authentication, and all mutation endpoints accept client-generated UUIDs so the frontend can create objects offline and reference them immediately.
+- **AI Analytics endpoint** — `POST /api/ai/analytics` implements a Text-to-SQL pipeline: Claude generates a `SELECT` query from a natural-language question in Albanian, the backend validates and executes it, then Claude formats the result into an Albanian answer. Read-only by construction (destructive keywords blocked).
 - **Automatic state synchronization** — creating an order for a reserved table atomically transitions the reservation to `ARRIVED` and the table to `ON_DINE`; paying or cancelling releases the table back to `AVAILABLE`. No orchestration required on the client.
 - **Reservation lifecycle** — complete workflow from `PENDING_REQUEST` through `CONFIRMED`, `ARRIVED`, `NO_SHOW`, `DECLINED`, and `CANCELLED`, with automatic table state transitions at each step.
 - **Table management with visual layout** — tables carry `positionX`, `positionY`, and `size` fields so admins can drag-and-drop the floor plan in the frontend and it persists atomically.
@@ -20,46 +21,64 @@ Built with **Spring Boot 3.5**, **Java 21**, **PostgreSQL 16**, and **Flyway** m
 
 ---
 
-## Architecture at a Glance
+## AI Analytics — Text-to-SQL Pipeline
 
+`POST /api/ai/analytics` implements a three-step pipeline that turns a natural-language business question into a factual, data-grounded answer:
+
+### 1. SQL generation
+
+The service sends the user's question to Claude Sonnet 4.5 along with:
+
+- A description of every table in the schema (columns, types, meanings)
+- A set of formatting rules (cents-to-euros conversion, timestamp handling, UUID column types)
+- Product-name matching guidance (variants like "Coca Cola 0.33l" vs "Coca Cola 0/0.33l" require `ILIKE '%cola%'`, not exact match)
+- Comparison patterns (`UNION ALL` for today-vs-yesterday, `DATE_TRUNC` for weekly grouping)
+
+Claude returns a single `SELECT` (or `WITH`) statement.
+
+### 2. Safety validation and execution
+
+Before the query is executed, `AIAnalyticsService.isSafe()` checks that:
+
+- The statement starts with `SELECT` or `WITH`
+- It does **not** contain any of: `DELETE`, `DROP`, `INSERT`, `UPDATE`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`
+
+Only if both checks pass does `JdbcTemplate` execute the query. This turns the endpoint into a strict read-only lens over the database.
+
+### 3. Answer formatting and chart detection
+
+The rows returned by the query are sent back to Claude with instructions to compose an Albanian answer for a café owner — short, concrete, with emoji where helpful. Cents are converted to euros in the prose. Comparisons express both the delta and the percentage change.
+
+In parallel, `detectChartType()` inspects the shape of the result and the phrasing of the question:
+
+- **Bar chart** — for ranking questions ("cili produkt shitet me shume", "top 5 …")
+- **Line chart** — for time-series questions ("trend i shitjeve kete jave", "cdo dite …")
+- **No chart** — for single-value answers ("sa fitim pata sot?")
+
+The response therefore contains:
+
+```json
+{
+  "answer": "Sot ke pas €24.00 total shitje me 5 porosi.",
+  "sql": "SELECT COALESCE(SUM(total),0)/100.0 ...",
+  "data": [ ... ],
+  "chartType": "bar",
+  "success": true,
+  "error": null
+}
 ```
-┌────────────────────────────────────────────────────────────┐
-│                   Spring Boot Backend                       │
-│                                                              │
-│   ┌────────────────┐        ┌─────────────────────┐        │
-│   │  REST API      │◄──────►│  Service Layer      │        │
-│   │  Controllers   │        │  (business logic,   │        │
-│   │  (validated    │        │   state transitions)│        │
-│   │   with Jakarta)│        └──────────┬──────────┘        │
-│   └────────┬───────┘                   │                    │
-│            │                            ▼                    │
-│            │                 ┌─────────────────────┐        │
-│            │                 │  JPA Repositories    │        │
-│            │                 │  (Spring Data)       │        │
-│            │                 └──────────┬──────────┘        │
-│            │                            │                    │
-│            │                            ▼                    │
-│            │                 ┌─────────────────────┐        │
-│            │                 │  PostgreSQL 16       │        │
-│            │                 │  (Docker container)  │        │
-│            │                 └─────────────────────┘        │
-│            │                                                 │
-│   ┌────────▼─────────────────────────────────────┐         │
-│   │  Sync-oriented endpoints                      │         │
-│   │  • GET /api/health   (connectivity check)     │         │
-│   │  • GET /api/staff/cache (BCrypt hashes)       │         │
-│   │  • POST /api/orders (accepts client UUIDs)    │         │
-│   └───────────────────────────────────────────────┘         │
-│                                                              │
-└──────────────────────────────────────────────┬──────────────┘
-                                                │ HTTP
-                                                ▼
-                             ┌──────────────────────────────┐
-                             │  Tauri Desktop Client         │
-                             │  (Vue 3, local SQLite,        │
-                             │   sync engine with retry)     │
-                             └──────────────────────────────┘
-```
+
+The frontend renders `answer` as chat text and, when `chartType` is present, renders `data` as a Chart.js bar or line chart in the same message bubble.
+
+### Example questions the assistant handles
+
+- "Sa fitim pata sot?"
+- "Cili produkt shitet me shume kete jave?"
+- "Sa Coca-Cola kane mbet?"
+- "Cili banakier ka bo me shume shitje?"
+- "Krahaso sot me dje"
+- "Sa rezervime kena kete jave?"
+- "Cilat tavolina kane sjelle me shume te ardhura?"
 
 ---
 
@@ -70,7 +89,7 @@ Built with **Spring Boot 3.5**, **Java 21**, **PostgreSQL 16**, and **Flyway** m
 - Java 21+
 - Maven 3.9+
 - Docker + Docker Compose (for PostgreSQL)
-- An Anthropic API key (for AI invoice scanning)
+- An Anthropic API key (for AI invoice scanning and analytics)
 
 ### 1. Start the database
 
@@ -108,13 +127,6 @@ so local secrets are automatically merged if present.
 
 The server starts on `http://localhost:8080`.
 
-On first startup:
-
-- Flyway applies migrations V2 through V5 automatically
-- 10 sample tables are seeded across Main Dining, Terrace, and Outdoor sections
-- Sample products, categories, staff, and suppliers are seeded if the database is empty
-- Default PINs: **Admin `0000`**, **Cashier `1234`**
-
 ---
 
 ## Tech Stack
@@ -122,11 +134,11 @@ On first startup:
 | Layer               | Technology                                              |
 |---------------------|---------------------------------------------------------|
 | Framework           | Spring Boot 3.5 (Web, Data JPA, Security, Validation)   |
-| Language            | Java 21 (records, pattern matching, sealed classes)     |
+| Language            | Java 21                                                 |
 | Database            | PostgreSQL 16 (Docker)                                  |
 | Schema versioning   | Flyway (V2–V5)                                          |
 | PDF generation      | Apache PDFBox 2.0.30                                    |
-| AI extraction       | Anthropic Claude API                                    |
+| AI extraction & Q&A | Anthropic Claude Sonnet 4.5                             |
 | Password hashing    | Spring Security BCrypt                                  |
 | Build tool          | Maven 3.9                                               |
 
@@ -136,7 +148,11 @@ On first startup:
 
 ```
 com.kendi.pos/
-├── ai/           # AI-powered invoice scanning (Anthropic Claude)
+├── ai/           # AI-powered features
+│   ├── AIAnalyticsController.java   # POST /api/ai/analytics
+│   ├── AIAnalyticsService.java      # Text-to-SQL pipeline via Claude
+│   ├── AIAnalyticsDtos.java         # Request/response records
+│   └── ...                          # AI invoice scanning
 ├── auth/         # PIN-based staff authentication (BCrypt)
 ├── category/     # Product categories
 ├── config/       # Spring Security and CORS configuration
@@ -151,82 +167,6 @@ com.kendi.pos/
 └── PosApplication.java
 ```
 
-Each package follows a consistent pattern: `Entity`, `Repository`, `Controller`, and `Service` (where business logic warrants separation).
-
----
-
-## Domain Model
-
-### Product
-
-Core entity with **flexible stock tracking**:
-
-- `stockUnit` — `PIECE` (whole units) or `KG` (weight-based)
-- `stockQuantity` — Current inventory (double for KG precision)
-- `trackStock` — If false, stock is ignored (e.g., for services)
-- `autoDeductOnSale` — For `PIECE` only; decrements stock on payment
-- `pricePerKg` / `defaultWeightG` — For KG-based products (e.g., mishi, djathi)
-
-### Order
-
-- Status flow: `open` → `closed` → `paid` (or `cancelled`)
-- Items reference products by ID and store `price` snapshot at order time
-- Payment supports cash, card, and per-table combined payment (`/pay-all`)
-- Tip tracking with `tipAmount` and `tipPercent` per order, proportional distribution across per-table combined payments
-- Automatic subtotal and total recalculation on every mutation
-- Stock deduction happens on payment for eligible products
-- **Accepts client-generated UUIDs** — order IDs and item IDs can be provided by the offline client
-- **Idempotent creation** — repeated `POST /orders` with the same ID returns the existing order (crucial for retry-safe sync)
-- **Auto-triggers reservation `ARRIVED`** when created for a table with a confirmed reservation
-- **Auto-releases table to `AVAILABLE`** when paid or cancelled and no other open orders remain
-
-### RestaurantTable
-
-Full table management with visual layout support:
-
-- `name` — Display name (unique)
-- `seatCount` — Number of seats (2, 4, 6, 8, 10)
-- `section` — `MAIN_DINING`, `TERRACE`, or `OUTDOOR`
-- `status` — `AVAILABLE`, `ON_DINE`, or `RESERVED`
-- `positionX` / `positionY` — Drag-and-drop coordinates for floor plan
-- `size` — Individual table size for visual rendering (100–250 px)
-- `sortOrder` — Fallback ordering for grid layout
-
-### Reservation
-
-Complete reservation lifecycle with automatic table state sync:
-
-- `guestName`, `guestPhone`, `guestCount` — Guest details
-- `reservationTime` — Requested date and time
-- `requestedBy` — Staff member who created the request
-- `status` — `PENDING_REQUEST`, `CONFIRMED`, `ARRIVED`, `NO_SHOW`, `DECLINED`, or `CANCELLED`
-- Timestamps: `confirmedAt`, `arrivedAt`, `noShowAt`, `createdAt`, `updatedAt`
-
-**Lifecycle:**
-
-1. Waiter creates request → `PENDING_REQUEST`
-2. Admin confirms → `CONFIRMED`, table becomes `RESERVED`
-3. Order opens for table → `ARRIVED`, table becomes `ON_DINE` (automatic)
-4. Order paid/cancelled → table returns to `AVAILABLE` (automatic)
-5. Admin can also manually mark `ARRIVED` or `NO_SHOW`
-
-### Staff
-
-- Roles: `admin` (full access) or `cashier` (POS only)
-- Authentication via 4-digit PIN (BCrypt-hashed)
-- `active` flag for enabling/disabling accounts
-- BCrypt hashes exposed via `/api/staff/cache` for **offline PIN validation** in the client
-
-### Supplier
-
-- Suppliers linked to products
-- Purchase orders generated as PDFs with itemized line items
-- Delivery history tracked separately for reconciliation
-
-### Category
-
-Simple product taxonomy — name, colour, and `sortOrder` for menu display order.
-
 ---
 
 ## API Overview
@@ -235,93 +175,60 @@ All endpoints are prefixed with `/api`.
 
 ### Sync (offline-first client support)
 
-- `GET /health` — Connectivity check for the client's sync engine, returns 200 with a small JSON body
+- `GET /health` — Connectivity check for the client's sync engine
 - `GET /staff/cache` — Returns staff records with BCrypt PIN hashes for offline login validation
+
+### AI
+
+- `POST /ai/analytics` — Natural-language business questions (Text-to-SQL via Claude). Returns answer, generated SQL, structured data for charts, and chart type
+- `POST /ai/invoice/scan` — Upload PDF invoice, receive extracted supplier and line items via Claude
 
 ### Products
 
-- `GET /products` — List all
-- `POST /products` — Create
-- `PUT /products/{id}` — Update
-- `DELETE /products/{id}` — Delete
-- `PATCH /products/{id}/stock` — Adjust stock quantity (positive or negative delta)
+- `GET /products` / `POST /products` / `PUT /products/{id}` / `DELETE /products/{id}`
+- `PATCH /products/{id}/stock` — Adjust stock quantity
 
 ### Orders
 
 - `GET /orders` — List with optional `status` or `tableId` filter
-- `POST /orders` — Create new order; accepts client-generated UUID, idempotent, auto-triggers reservation `ARRIVED`
-- `PUT /orders/{id}` — Update items on an open order (also triggers auto-arrived)
-- `POST /orders/{id}/close` — Close order (finalize before payment)
+- `POST /orders` — Create; accepts client-generated UUID, idempotent, auto-triggers reservation `ARRIVED`
+- `PUT /orders/{id}` — Update items
+- `POST /orders/{id}/close` — Close order
 - `POST /orders/{id}/pay` — Process payment (deducts stock, releases table)
-- `POST /orders/{id}/cancel` — Cancel order (releases table if no other open orders)
-- `POST /orders/table/{tableId}/pay-all` — Combined payment for all open orders on a table, with proportional tip distribution
+- `POST /orders/{id}/cancel` — Cancel
+- `POST /orders/table/{tableId}/pay-all` — Combined payment for a table with proportional tip distribution
 
 ### Tables
 
-- `GET /tables` — List all, filterable by `section`
-- `GET /tables/{id}` — Get single table
-- `POST /tables` — Create new table
-- `PUT /tables/{id}` — Update table (name, seats, section)
-- `PATCH /tables/{id}/position` — Update `x` / `y` coordinates (drag-and-drop)
-- `PATCH /tables/{id}/size` — Update visual size
-- `PATCH /tables/{id}/status` — Update status manually
-- `DELETE /tables/{id}` — Delete table
+- `GET /tables` / `POST /tables` / `PUT /tables/{id}` / `DELETE /tables/{id}`
+- `PATCH /tables/{id}/position` — Drag-and-drop coordinates
+- `PATCH /tables/{id}/size` — Visual size
+- `PATCH /tables/{id}/status` — Manual status update
 
 ### Reservations
 
-- `GET /reservations` — List all, filterable by `status`
-- `GET /reservations/history?status=&from=&to=` — Historical reservations with date range and status filter
-- `GET /reservations/stats/today` — Today's statistics (arrived, no-shows, show-up rate)
-- `GET /reservations/stats/range?from=YYYY-MM-DD&to=YYYY-MM-DD` — Statistics for a date range
-- `POST /reservations/requests` — Create reservation request (from waiter)
-- `PATCH /reservations/{id}/confirm` — Admin confirms (table becomes `RESERVED`)
-- `PATCH /reservations/{id}/decline` — Admin declines
-- `PATCH /reservations/{id}/arrived` — Manually mark as arrived (table becomes `ON_DINE`)
-- `PATCH /reservations/{id}/no-show` — Mark as no-show (table returns to `AVAILABLE`)
+- `GET /reservations` — List, filterable by `status`
+- `GET /reservations/history?status=&from=&to=` — Historical
+- `GET /reservations/stats/today` / `/stats/range?from=&to=` — Statistics
+- `POST /reservations/requests` — Create request (from waiter)
+- `PATCH /reservations/{id}/confirm` / `/decline` / `/arrived` / `/no-show`
 
 ### Staff and Auth
 
-- `POST /auth/login` — Login with PIN, returns token and staff info
-- `GET /staff` — List all staff (admin)
+- `POST /auth/login` — Login with PIN
+- `GET /staff` / `POST /staff` / `PUT /staff/{id}` / `DELETE /staff/{id}`
 - `GET /staff/cache` — BCrypt hashes for offline validation
-- `POST /staff` — Create staff member
-- `PUT /staff/{id}` — Update
-- `DELETE /staff/{id}` — Deactivate
-
-### AI Invoice Scanning
-
-- `POST /ai/invoice/scan` — Upload PDF invoice, receive extracted supplier and line items via Claude
 
 ### Reports
 
-- `GET /reports/z-report?date=YYYY-MM-DD` — Daily Z-report (total, cash, card, top products, orders)
-- `GET /reports/staff?staffId=&date=` — Per-staff performance report with tips
-- `GET /reports/monthly?from=&to=` — Monthly accountant report (available client-side by aggregating daily z-reports)
+- `GET /reports/z-report?date=YYYY-MM-DD` — Daily Z-report
+- `GET /reports/staff?staffId=&date=` — Per-staff performance
+- `GET /reports/monthly?from=&to=` — Monthly accountant report
 
 ### Suppliers and Deliveries
 
-- `GET /suppliers` — List all
-- `POST /suppliers` — Create
-- `POST /suppliers/{id}/order` — Generate PDF purchase order
-- `GET /deliveries` — Delivery history
-- `POST /deliveries` — Record incoming delivery (updates stock)
-
----
-
-## Database Migrations
-
-Flyway migrations live in `src/main/resources/db/migration/`. Applied automatically on startup:
-
-- **V2** — Create `restaurant_tables` (name, seat_count, section, status, position_x/y)
-- **V3** — Add `sort_order` column for grid fallback
-- **V4** — Create `reservations` (guest info, status lifecycle, timestamps)
-- **V5** — Add `size` column to tables for per-table visual sizing
-
-To add a new migration:
-
-1. Create `V{N}__description.sql` in `db/migration/`
-2. Increment the version number
-3. Restart the app — Flyway applies it automatically
+- `GET /suppliers` / `POST /suppliers` / `POST /suppliers/{id}/order`
+- `GET /deliveries` / `POST /deliveries`
 
 ---
 
@@ -334,26 +241,22 @@ The system maintains **automatic consistency** between three related entities so
 1. **On order creation** for a table with a confirmed reservation:
    - Reservation status → `ARRIVED`
    - Table status → `ON_DINE`
-   - `arrivedAt` timestamp populated
-2. **On order payment or cancellation** when no other open orders exist for the table:
+2. **On order payment or cancellation** (no other open orders):
    - Table status → `AVAILABLE`
 3. **On admin reservation confirmation**:
    - Table status → `RESERVED`
-   - `confirmedAt` timestamp populated
-
-Waitstaff and admins see real-time, consistent state across all views without manual synchronization.
 
 ### Idempotent Order Creation
 
-`POST /orders` is idempotent: if the client sends the same `id` twice (common when a sync retry hits after an ambiguous timeout), the server returns the existing order instead of creating a duplicate. This is essential for a reliable offline-first client.
+`POST /orders` is idempotent: if the client sends the same `id` twice (common when a sync retry hits after an ambiguous timeout), the server returns the existing order instead of creating a duplicate. Essential for a reliable offline-first client.
 
 ### Stock Deduction
 
-Only products with `trackStock=true`, `autoDeductOnSale=true`, and `stockUnit=PIECE` are auto-deducted on payment. KG products require manual adjustment (recipe-based deduction is planned for a future release).
+Only products with `trackStock=true`, `autoDeductOnSale=true`, and `stockUnit=PIECE` are auto-deducted on payment. KG products require manual adjustment.
 
 ### Tip Handling
 
-Orders carry `tipAmount` and `tipPercent`. When combining payments for a table (`/pay-all`), the total tip is distributed proportionally across orders based on each order's total, with rounding delta applied to the last order to keep the sum exact.
+Orders carry `tipAmount` and `tipPercent`. When combining payments for a table (`/pay-all`), the total tip is distributed proportionally across orders based on each order's total, with rounding delta applied to the last order.
 
 ---
 
@@ -365,30 +268,9 @@ Current setup is **development-friendly**:
 - Session management is **stateless**
 - All endpoints are **permitAll** for now
 - Method-level security (`@EnableMethodSecurity`) is enabled and ready for role-based access
+- **AI analytics endpoint is read-only by construction** — the SQL safety guard blocks all destructive statements before execution
 
-**Planned:** JWT authentication with role-based `@PreAuthorize` guards for admin-only operations (add/edit/delete tables, confirm/decline reservations, staff management).
-
----
-
-## Development
-
-### Run tests
-
-```bash
-./mvnw test
-```
-
-### Build a jar
-
-```bash
-./mvnw clean package
-```
-
-The runnable jar lands in `target/pos-0.0.1-SNAPSHOT.jar`.
-
-### Hot reload
-
-Spring Boot DevTools is included. Edit code, save, and the app restarts automatically.
+**Planned:** JWT authentication with role-based `@PreAuthorize` guards for admin-only operations (add/edit/delete tables, confirm/decline reservations, staff management, AI analytics).
 
 ---
 
@@ -397,7 +279,7 @@ Spring Boot DevTools is included. Edit code, save, and the app restarts automati
 The Vue 3 + Tauri desktop frontend lives in a separate repository:
 **[kendi-pos-frontend](https://github.com/BrikendGjyliqi/kendi-pos-frontend)**
 
-The frontend uses a local SQLite database as its read source of truth and reconciles with this backend via a 15-second polling sync engine. It expects the backend on `http://localhost:8080`, and continues to operate in offline mode when the backend is unreachable, queuing all mutations for later flush.
+The frontend uses a local SQLite database as its read source of truth and reconciles with this backend via a 15-second polling sync engine. It expects the backend on `http://localhost:8080`, and continues to operate in offline mode when the backend is unreachable, queuing all mutations for later flush. The Ask AI chat interface communicates exclusively with `POST /api/ai/analytics`.
 
 ---
 
@@ -410,17 +292,18 @@ Completed for the current thesis milestone:
 - ✅ Table drag-and-drop layout persistence
 - ✅ Offline-first client support (health endpoint, staff cache, idempotent creation, client-generated UUIDs)
 - ✅ AI invoice scanning via Anthropic Claude
+- ✅ **AI Analytics endpoint — Text-to-SQL business intelligence in Albanian**
 - ✅ PDF supplier orders via Apache PDFBox
 - ✅ Statistical reports (daily, monthly, per-staff)
 - ✅ Flexible stock tracking with automatic deduction
 
 Deferred to future work:
 
-- JWT authentication with proper role-based `@PreAuthorize` guards
-- Auto no-show scheduler (cron job to mark stale reservations)
+- JWT authentication with role-based guards
+- Auto no-show scheduler
 - WebSocket push notifications for new reservation requests
 - Fiscal integration (ATK Kosovo)
-- Recipe-based stock deduction for KG products
+- Proactive AI insights (daily digest, predictive stock reordering)
 
 ---
 
