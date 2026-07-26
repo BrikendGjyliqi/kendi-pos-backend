@@ -7,7 +7,6 @@ import jakarta.persistence.*;
 public class OrderItem {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
     private String id;
 
     @ManyToOne(fetch = FetchType.LAZY)
@@ -24,7 +23,7 @@ public class OrderItem {
     @Column(nullable = false)
     private int price;
 
-    @Column(name = "category_id", nullable = false)
+    @Column
     private String categoryId;
 
     @Column(nullable = false)
@@ -56,4 +55,5 @@ public class OrderItem {
     public void setComment(String comment) { this.comment = comment; }
     public long getAddedAt() { return addedAt; }
     public void setAddedAt(long addedAt) { this.addedAt = addedAt; }
+
 }

@@ -7,8 +7,11 @@ import com.kendi.pos.restotable.ReservationService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
 
 import java.util.List;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/orders")
@@ -18,6 +21,9 @@ public class OrderController {
     private final OrderRepository repo;
     private final ProductRepository productRepo;
     private final ReservationService reservationService;
+
+    @PersistenceContext
+    private EntityManager entityManager;
 
     public OrderController(OrderRepository repo, ProductRepository productRepo, ReservationService reservationService) {
         this.repo = repo;
@@ -52,12 +58,25 @@ public class OrderController {
     @PostMapping
     @Transactional
     public Order create(@RequestBody Order order) {
+        // Nese id nuk osht dhene, gjeneroje
+        if (order.getId() == null || order.getId().isEmpty()) {
+            order.setId(UUID.randomUUID().toString());
+        } else {
+            // Idempotency: nese ekziston, kthe ekzistuesin
+            if (repo.existsById(order.getId())) {
+                return repo.findById(order.getId()).get();
+            }
+        }
+
         order.setOpenedAt(System.currentTimeMillis());
         if (order.getStatus() == null) {
             order.setStatus("open");
         }
         if (order.getItems() != null) {
             for (OrderItem item : order.getItems()) {
+                if (item.getId() == null || item.getId().isEmpty()) {
+                    item.setId(UUID.randomUUID().toString());
+                }
                 item.setOrder(order);
                 if (item.getAddedAt() == 0) {
                     item.setAddedAt(System.currentTimeMillis());
@@ -65,15 +84,11 @@ public class OrderController {
             }
         }
         recalculate(order);
+
         Order saved = repo.save(order);
 
-        // Auto-mark rezervimin si ARRIVED dhe tavolinen ON_DINE
-        try {
-            Long tableIdLong = Long.parseLong(order.getTableId());
-            reservationService.markArrivedByTable(tableIdLong);
-        } catch (NumberFormatException e) {
-            // tableId nuk eshte numer - skip
-        }
+        // ─── AUTO-ARRIVED: kur krijohet porosi, tavolina ne ON_DINE + rezervim ARRIVED ───
+        markTableArrivedIfNeeded(order.getTableId());
 
         return saved;
     }
@@ -90,16 +105,27 @@ public class OrderController {
                     existing.getItems().clear();
                     if (updated.getItems() != null) {
                         for (OrderItem item : updated.getItems()) {
-                            item.setOrder(existing);
-                            if (item.getAddedAt() == 0) {
-                                item.setAddedAt(System.currentTimeMillis());
-                            }
-                            existing.getItems().add(item);
+                            OrderItem newItem = new OrderItem();
+                            newItem.setId(item.getId() != null && !item.getId().isEmpty()
+                                    ? item.getId()
+                                    : UUID.randomUUID().toString());
+                            newItem.setOrder(existing);
+                            newItem.setProductId(item.getProductId());
+                            newItem.setName(item.getName());
+                            newItem.setPrice(item.getPrice());
+                            newItem.setQuantity(item.getQuantity());
+                            newItem.setAddedAt(item.getAddedAt() != 0 ? item.getAddedAt() : System.currentTimeMillis());
+                            existing.getItems().add(newItem);
                         }
                     }
                     existing.setDiscount(updated.getDiscount());
                     recalculate(existing);
-                    return ResponseEntity.ok(repo.save(existing));
+                    Order saved = repo.save(existing);
+
+                    // Nese admin fillon me shtu items nga porosi ekzistuese, kontrollo prap
+                    markTableArrivedIfNeeded(existing.getTableId());
+
+                    return ResponseEntity.ok(saved);
                 })
                 .orElse(ResponseEntity.notFound().build());
     }
@@ -123,7 +149,6 @@ public class OrderController {
                 .orElse(ResponseEntity.notFound().build());
     }
 
-    // POST pay — porosi e vetme
     @PostMapping("/{id}/pay")
     @Transactional
     public ResponseEntity<Order> pay(@PathVariable String id, @RequestBody PaymentRequest req) {
@@ -142,11 +167,9 @@ public class OrderController {
                     o.setPaidAt(now);
                     if (o.getClosedAt() == null) o.setClosedAt(now);
 
-                    // Pakeso stokun per items me autoDeduct
                     deductStockForOrder(o);
                     Order saved = repo.save(o);
 
-                    // Liro tavolinen nese s'ka porosi tjeter open/closed
                     releaseTableIfNoActiveOrders(o.getTableId());
 
                     return ResponseEntity.ok(saved);
@@ -166,7 +189,6 @@ public class OrderController {
                     o.setClosedAt(System.currentTimeMillis());
                     Order saved = repo.save(o);
 
-                    // Liro tavolinen nese s'ka porosi tjeter
                     releaseTableIfNoActiveOrders(o.getTableId());
 
                     return ResponseEntity.ok(saved);
@@ -218,13 +240,11 @@ public class OrderController {
                 firstOrder = false;
             }
 
-            // Pakeso stokun per items me autoDeduct
             deductStockForOrder(o);
 
             repo.save(o);
         }
 
-        // Liro tavolinen
         releaseTableIfNoActiveOrders(tableId);
 
         return unpaid;
@@ -248,10 +268,6 @@ public class OrderController {
         order.setTotal(Math.max(0, subtotal - order.getDiscount()));
     }
 
-    // ─── Stock deduction ───
-    // Per çdo item ne porosi: nese produkti ka trackStock=true dhe autoDeductOnSale=true
-    // dhe stockUnit=PIECE, atehere pakeso quantity nga stoku.
-    // KG nuk pakesohet automatikisht (pret Fazen 1b — recete).
     private void deductStockForOrder(Order order) {
         for (OrderItem item : order.getItems()) {
             productRepo.findById(item.getProductId()).ifPresent(product -> {
@@ -263,6 +279,20 @@ public class OrderController {
                     productRepo.save(product);
                 }
             });
+        }
+    }
+
+    /**
+     * Kur krijohet nje porosi, thirre reservationService per me e bo tavolinen ON_DINE
+     * dhe (nese ka) rezervimin ARRIVED. Silently skip nese tableId s'osht valid.
+     */
+    private void markTableArrivedIfNeeded(String tableId) {
+        if (tableId == null || tableId.isEmpty()) return;
+        try {
+            Long tableIdLong = Long.parseLong(tableId);
+            reservationService.markArrivedByTable(tableIdLong);
+        } catch (NumberFormatException e) {
+            // tableId s'osht numer - skip
         }
     }
 
@@ -279,7 +309,7 @@ public class OrderController {
                 Long tableIdLong = Long.parseLong(tableId);
                 reservationService.releaseTable(tableIdLong);
             } catch (NumberFormatException e) {
-                // tableId nuk eshte numer - skip
+                // tableId s'osht numer - skip
             }
         }
     }
